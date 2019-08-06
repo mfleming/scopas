@@ -144,21 +144,27 @@ OUTPUT=$(curl -s -H "Content-Type: application/json" \
     }' \
     https://api.linode.com/v4/linode/instances)
 
-log Waiting for instance to initialise...
-
 BUILDER_ID=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['id']")
 BUILDER_IP=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['ipv4'][0]")
 
-log Found $BUILDER_ID @ $BUILDER_IP
+log "Found builder (ID: $BUILDER_ID) @ $BUILDER_IP"
 
 BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
     https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
     python -c "import sys, json; print(json.load(sys.stdin))['status']")
 
-log Waiting for instance to boot
-
+log Provisioning builder
 BUILDER_STATUS=provisioning
-while [ "$BUILDER_STATUS" != "running" ]; do
+while [ "$BUILDER_STATUS" = "provisioning" ]; do
+	BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+	    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
+	    python -c "import sys, json; print(json.load(sys.stdin))['status']")
+	sleep 2
+done
+
+log Booting builder
+BUILDER_STATUS=booting
+while [ "$BUILDER_STATUS" = "booting" ]; do
 	BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
 	    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
 	    python -c "import sys, json; print(json.load(sys.stdin))['status']")
@@ -272,4 +278,4 @@ fetch_logs
 
 delete_builder
 BUILDER_LIVE=false
-log "(6/6) Finished"
+yellow "(6/6) Finished"
