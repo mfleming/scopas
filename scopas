@@ -83,6 +83,8 @@ function die() {
 #    1.2.2 Configs
 #
 
+[ -e ~/.scopas ] && log "Using configuration file ~/.scopas"
+
 function get_config() {
 	echo $(grep "$*" ~/.scopas | awk -F= '{print $2}')
 }
