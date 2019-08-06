@@ -104,11 +104,34 @@ yellow "(1/6) Deploying Linode instance"
 #
 # 2. Create builder
 #
+#
+# 2.1. See if we can use golden image to reduce deploy time
+#
+
+OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+    https://api.linode.com/v4/images/)
+
+PYSCRIPT="
+import sys
+import json
+
+data = json.load(sys.stdin)['data']
+for x in data:
+    if x['label'] == 'scopas_gold_master':
+        print(x['id'])
+"
+IMAGE_ID=$(echo $OUTPUT | python -c "$PYSCRIPT")
+
+if [ "$IMAGE_ID" = "" ]; then
+	log No golden builder image found. Creating from scratch
+	CREATE_IMAGE=true
+	IMAGE_ID=$INSTANCE_IMAGE
+fi
 
 OUTPUT=$(curl -s -H "Content-Type: application/json" \
     -H "Authorization: Bearer $API_TOKEN" \
     -X POST -d '{
-      "image": '\"$INSTANCE_IMAGE\"',
+      "image": '\"$IMAGE_ID\"',
       "root_pass": "c001P455w0rd",
       "authorized_keys": [
         '\""$SSH_KEY"\"'
