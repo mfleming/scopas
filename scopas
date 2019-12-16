@@ -43,7 +43,10 @@ function yellow() {
 
 function fetch_logs() {
 	log Fetching results and monitoring logs
-	scp $FLAGS root@$BUILDER_IP:/tmp/scopas-{install,git,build,vmstat,mpstat,iostat}.log . &>/dev/null
+	$RSH "systemd-analyze blame &> /tmp/scopas-systemd-analyze-blame.log"
+	$RSH "systemd-analyze critical-chain &> /tmp/scopas-systemd-analyze-critical-chain.log"
+
+	scp $FLAGS root@$BUILDER_IP:/tmp/scopas-*.log . &>/dev/null
 }
 
 function delete_builder() {
