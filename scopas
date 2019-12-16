@@ -24,9 +24,14 @@
 # 
 
 BUILDER_LIVE=false
+CREATE_IMAGE=false
 
 function log() {
 	echo $* | ts "[%b %d %H:%M:%S]"
+}
+
+function debug() {
+	[ $DEBUG -eq 1 ] && log "[DEBUG]" $*
 }
 
 function red() {
@@ -50,6 +55,49 @@ function fetch_logs() {
 }
 
 function delete_builder() {
+	if [ "$CREATE_IMAGE" = true ]; then
+		log Creating new golden image
+
+		OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+		    https://api.linode.com/v4/linode/instances/$BUILDER_ID/configs)
+
+		echo $OUTPUT
+
+		DISK_ID=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['data'][0]['devices']['sda']['disk_id']")
+		echo Found disk ID $DISK_ID
+
+		OUTPUT=$(curl -s -H "Content-Type: application/json" \
+		    -H "Authorization: Bearer $API_TOKEN" \
+		    -X POST -d "{
+		      \"disk_id\": $DISK_ID,
+		      \"label\": \"scopas_gold_master\",
+		      \"description\": \"openSUSE image with all packages and local git repository.\"
+		    }" \
+		    https://api.linode.com/v4/images)
+		IMAGE_ID=$(echo $OUTPUT | python -c "import sys,json; print(json.load(sys.stdin))['id']")
+
+		log "Hit enter when the image has been created"
+		read
+	fi
+
+	log Shutting down instance
+	OUTPUT=$(curl -s -H "Content-Type: application/json" \
+	    -H "Authorization: Bearer $API_TOKEN" \
+	    -X POST \
+	    https://api.linode.com/v4/linode/instances/$BUILDER_ID/shutdown)
+
+	while [ "$(echo $OUTPUT | grep  'Linode busy')" != "" ]; do
+		sleep 2
+		OUTPUT=$(curl -s -H "Content-Type: application/json" \
+		    -H "Authorization: Bearer $API_TOKEN" \
+		    -X POST \
+		    https://api.linode.com/v4/linode/instances/$BUILDER_ID/shutdown)
+	done
+
+	BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+	    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
+	    python -c "import sys, json; print(json.load(sys.stdin))['status']")
+
 	log Deleting builder $BUILDER_ID
 	curl -s -H "Authorization: Bearer $API_TOKEN" \
 	    -X DELETE \
@@ -68,6 +116,69 @@ function die() {
 	exit 1
 }
 
+function usage() {
+	cat <<EOF
+Usage: $PROGNAME [OPTION]...
+Provision and configure a cloud instance to build a Linux kernel.
+
+  -c, --clean-image          do not use a custom instance image even if
+                             configured
+  -d, --debug                enable debug output
+  -h, --help                 display this help and exit
+  -n,--name NAME             create an instance with the label NAME
+  -s, --shell                just boot the instance to a shell but do
+                             not configure or build a kernel
+  -x, --stats                print various statistics including billing
+                             info for the build
+
+EOF
+}
+
+PROGNAME=$(basename $0)
+
+DEBUG=0
+SHELL=0
+NAME=builder
+STATS=false
+TIMESTAMP=false
+TIMESTAMP_OPTION=""
+
+# Use the cloud's standard image, not a custom one evne if it's
+# specified in the config file.
+CLEAN_IMAGE=0
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-c|--clean-image)
+		CLEAN_IMAGE=1
+		shift
+		;;
+	-d|--debug)
+		DEBUG=1
+		shift
+		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
+	-n|--name)
+		[ $# -lt 2 ] && die "Unsuffifient args for $1 param"
+		NAME=$2
+		shift 2
+		;;
+	-s|--shell)
+		SHELL=1
+		shift
+		;;
+	-x|--stats)
+		STATS=true
+		shift
+		;;
+	*)
+		die "Unknown param"
+		;;
+	esac
+done
 
 #
 # 1. Read configuration
@@ -86,23 +197,40 @@ function die() {
 #    1.2.2 Configs
 #
 
-[ -e ~/.scopas ] && log "Using configuration file ~/.scopas"
+[ -e ~/.scopas ] && {
+	log "Using configuration file ~/.scopas"
 
-function get_config() {
-	echo $(grep "$*" ~/.scopas | awk -F= '{print $2}')
+	function get_config() {
+		echo $(grep "$*" ~/.scopas | awk -F= '{print $2}')
+	}
+
+	API_TOKEN=$(get_config API_TOKEN)
+	INSTANCE_TYPE=$(get_config INSTANCE_TYPE)
+	INSTANCE_IMAGE=$(get_config INSTANCE_IMAGE)
+	INSTANCE_NAME=$(get_config INSTANCE_NAME)
+	INSTANCE_REGION=$(get_config INSTANCE_REGION)
+	INSTANCE_VOLUME=$(get_config INSTANCE_VOLUME)
+
+	BUILDER_NAME=$(get_config BUILDER_NAME)
+	SSH_KEY_PATH=$(get_config SSH_KEY_PATH)
+	SSH_KEY=$(cat ${SSH_KEY_PATH})
 }
 
-API_TOKEN=$(get_config API_TOKEN)
-INSTANCE_TYPE=$(get_config INSTANCE_TYPE)
-INSTANCE_IMAGE=$(get_config INSTANCE_IMAGE)
-INSTANCE_NAME=$(get_config INSTANCE_NAME)
-INSTANCE_REGION=$(get_config INSTANCE_REGION)
+function get_balances() {
+	OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+		    https://api.linode.com/v4/account)
+	BALANCE=$(echo $OUTPUT | jq '.balance')
+	BALANCE_UNINVOICED=$(echo $OUTPUT | jq '.balance_uninvoiced')
 
-BUILDER_NAME=$(get_config BUILDER_NAME)
-SSH_KEY_PATH=$(get_config SSH_KEY_PATH)
-SSH_KEY=$(cat ${SSH_KEY_PATH})
+	#echo "Balances: $BALANCE + $BALANCE_UNINVOICED"
 
-yellow "(1/6) Deploying Linode instance"
+	NEW_BALANCE=$(jq -n "$BALANCE + $BALANCE_UNINVOICED")
+	echo $NEW_BALANCE
+}
+
+[ $STATS = true ] && {
+	START_BALANCE="$(get_balances)"
+}
 
 #
 # 2. Create builder
@@ -110,72 +238,83 @@ yellow "(1/6) Deploying Linode instance"
 #
 # 2.1. See if we can use golden image to reduce deploy time
 #
+function create_builder() {
+	yellow "(1/6) Deploying Linode instance"
 
-OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
-    https://api.linode.com/v4/images/)
-
-PYSCRIPT="
-import sys
-import json
-
-data = json.load(sys.stdin)['data']
-for x in data:
-    if x['label'] == 'scopas_gold_master':
-        print(x['id'])
-"
-IMAGE_ID=$(echo $OUTPUT | python -c "$PYSCRIPT")
-
-if [ "$IMAGE_ID" = "" ]; then
-	log No golden builder image found. Creating from scratch
-	CREATE_IMAGE=true
 	IMAGE_ID=$INSTANCE_IMAGE
-fi
+	[ $CLEAN_IMAGE -eq 0 ] && {
+		OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+		    https://api.linode.com/v4/images/)
 
-OUTPUT=$(curl -s -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $API_TOKEN" \
-    -X POST -d '{
-      "image": '\"$IMAGE_ID\"',
-      "root_pass": "c001P455w0rd",
-      "authorized_keys": [
-        '\""$SSH_KEY"\"'
-      ],
-      "booted": true,
-      "label": "builder",
-      "type": '\"$INSTANCE_TYPE\"',
-      "region": "eu-west",
-      "group": "Linode-Group"
-    }' \
-    https://api.linode.com/v4/linode/instances)
+		PYSCRIPT="
+		import sys
+		import json
 
-BUILDER_ID=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['id']")
-BUILDER_IP=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['ipv4'][0]")
+		data = json.load(sys.stdin)['data']
+		for x in data:
+		    if x['label'] == 'scopas_gold_master':
+		        print(x['id'])
+		"
+		debug $OUTPUT
+		IMAGE_ID=$(echo $OUTPUT | python -c "$PYSCRIPT")
 
-log "Found builder (ID: $BUILDER_ID) @ $BUILDER_IP"
+		if [ "$IMAGE_ID" = "" ]; then
+			log No golden builder image found. Creating from scratch
+			CREATE_IMAGE=true
+		fi
+	}
 
-BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
-    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
-    python -c "import sys, json; print(json.load(sys.stdin))['status']")
+	OUTPUT=$(curl -s -H "Content-Type: application/json" \
+	    -H "Authorization: Bearer $API_TOKEN" \
+	    -X POST -d '{
+	      "image": '\"$IMAGE_ID\"',
+	      "root_pass": "c001P455w0rd",
+	      "authorized_keys": [
+	        '\""$SSH_KEY"\"'
+	      ],
+	      "booted": true,
+	      "label": '\"$NAME\"',
+	      "type": '\"$INSTANCE_TYPE\"',
+	      "region": "eu-west",
+	      "group": "Linode-Group"
+	    }' \
+	    https://api.linode.com/v4/linode/instances)
 
-log Provisioning builder
-BUILDER_STATUS=provisioning
-while [ "$BUILDER_STATUS" = "provisioning" ]; do
+	debug $OUTPUT
+	BUILDER_ID=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['id']")
+	BUILDER_IP=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['ipv4'][0]")
+
+	log "Found $NAME (ID: $BUILDER_ID) @ $BUILDER_IP"
+
 	BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
 	    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
 	    python -c "import sys, json; print(json.load(sys.stdin))['status']")
-	sleep 2
-done
 
-log Booting builder
-BUILDER_STATUS=booting
-while [ "$BUILDER_STATUS" = "booting" ]; do
-	BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
-	    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
-	    python -c "import sys, json; print(json.load(sys.stdin))['status']")
-	sleep 2
-done
+	debug $BUILDER_STATUS
 
-green "Builder is live"
-BUILDER_LIVE=true
+	log Provisioning builder
+	BUILDER_STATUS=provisioning
+	while [ "$BUILDER_STATUS" = "provisioning" ]; do
+		BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+		    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
+		    python -c "import sys, json; print(json.load(sys.stdin))['status']")
+		debug $BUILDER_STATUS
+		sleep 2
+	done
+
+	log Booting builder
+	BUILDER_STATUS=booting
+	while [ "$BUILDER_STATUS" = "booting" ]; do
+		BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+		    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
+		    python -c "import sys, json; print(json.load(sys.stdin))['status']")
+		debug $BUILDER_STATUS
+		sleep 2
+	done
+
+	green "Builder is live (waiting for SSH server)"
+	BUILDER_LIVE=true
+}
 
 #
 # 3. Configure builder
@@ -183,91 +322,185 @@ BUILDER_LIVE=true
 # Install necessary packages to build a kernel using a OS-neutral
 # solution like PackageKit
 #
-FLAGS='-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=1 -o LogLevel=QUIET'
-RSH="ssh $FLAGS -i $SSH_KEY_PATH root@$BUILDER_IP"
+function configure_builder() {
+	FLAGS='-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=1 -o LogLevel=QUIET'
+	RSH="ssh $FLAGS -i $SSH_KEY_PATH root@$BUILDER_IP"
 
-log Waiting for SSH server
-
-$RSH uname -r &> /dev/null
-while [ $? -ne 0 ]; do
 	$RSH uname -r &> /dev/null
-done
+	while [ $? -ne 0 ]; do
+		$RSH uname -r &> /dev/null
+	done
 
-log Cleaning old logs
-$RSH "rm -f /tmp/scopas-*.log"
+	[ $SHELL -eq 1 ] && {
+		log "Builder ready. Connect with the following command"
+		log "$RSH"
+		exit 0
+	}
 
-function rcmd_install() {
-	$RSH "( $* ) &>> /tmp/scopas-install.log"
-	[ $? -eq 0 ] || die "Failed to install packages"
+	function rcmd_install() {
+		$RSH "( $* ) &>> /tmp/scopas-install.log"
+		[ $? -eq 0 ] || die "Failed to install packages"
+	}
+
+	yellow "(2/6) Configuring Linode instance"
+
+	log Cleaning old logs
+	$RSH "rm -f /tmp/scopas-*.log"
+
+	[ $CREATE_IMAGE = true ] && {
+		#$RSH "zypper clean -a"
+
+		#log Deleting installed network config files
+		#$RSH "cd /etc/sysconfig/network/ && mv .ifcfg-eth0.linode-orig ifcfg-eth0 && mv .routes.linode-orig routes" &> /dev/null
+		#[ $? -eq 0 ] && log Deleted successfully
+
+		#log "Reducing DHCP and network interface wait time"
+		#$RSH "sed -i -e 's;DHCLIENT_WAIT_AT_BOOT=.*;DHCLIENT_WAIT_AT_BOOT=\"1\";' /etc/sysconfig/network/dhcp"
+		#$RSH "sed -i -e 's;DHCLIENT6_WAIT_AT_BOOT=.*;DHCLIENT6_WAIT_AT_BOOT=\"1\";' /etc/sysconfig/network/dhcp"
+		#$RSH "sed -i -e 's;WAIT_FOR_INTERFACES=.*;WAIT_FOR_INTERFACES=\"\";' /etc/sysconfig/network/config"
+
+		log "Reducing boot loader menu timeout"
+		$RSH "sed -i -e 's;set timeout=.*;set timeout=\"0\";' /boot/grub/grub.cfg"
+
+	}
+
+	[ ! "$INSTANCE_VOLUME" = "" ] && {
+		OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+		    https://api.linode.com/v4/volumes)
+
+		VOLUME_ID=$(echo $OUTPUT | jq '.data[0].id')
+
+		OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
+		    https://api.linode.com/v4/linode/instances/$BUILDER_ID/configs)
+
+		CONFIG_ID=$(echo $OUTPUT | jq '.data[0].id')
+
+		log "Attaching vol: $VOLUME_ID (config: $CONFIG_ID)"
+		OUTPUT=$(curl -s -H "Content-Type: application/json" \
+		    -H "Authorization: Bearer $API_TOKEN" \
+		    -X POST -d '{
+		      "linode_id": '$BUILDER_ID',
+		      "config_id": '$CONFIG_ID'
+		    }' \
+		    https://api.linode.com/v4/volumes/$VOLUME_ID/attach)
+
+		[ "$($RSH 'grep scopas-vol /etc/fstab')" = "" ] && {
+			log "Adding storage volume to /etc/fstab"
+			$RSH "mkdir -p /mnt/scopas-vol"
+			$RSH "echo '/dev/disk/by-id/scsi-0Linode_Volume_scopas-vol /mnt/scopas-vol ext4 defaults,noatime,nofail,data=writeback,barrier=0 0 2' >> /etc/fstab"
+		}
+
+		log "Mounting volume"
+		$RSH "mount /mnt/scopas-vol"
+
+		# Spin until disk appears
+		ROOT_DEV=$($RSH "df -h / | tail -n1 | awk '{print \$1}'")
+		OUTPUT=$($RSH "df -h /mnt/scopas-vol" | grep $ROOT_DEV)
+		while [ ! "$OUTPUT" = "" ]; do
+			debug $OUTPUT
+			$RSH "mount /mnt/scopas-vol"
+			OUTPUT=$($RSH "df -h /mnt/scopas-vol" | grep $ROOT_DEV)
+			sleep 2
+		done
+	}
+
+	[ "$($RSH 'make --version' 2>&1 | grep 'not found')" = "" ] || {
+		log Installing packages
+
+		# Ubuntu
+		#rcmd_install "apt update && DEBIAN_FRONTEND=noninteractive apt-get --assume-yes install -qq gcc git make flex bison patch libelf-dev bc sysstat libssl-dev"
+
+		# openSUSE
+		rcmd_install "zypper refresh && zypper -n install -y gcc git make flex bison patch libelf-devel libopenssl-devel bc sysstat"
+	}
+
+	log Monitoring builder
+
+	$RSH "vmstat 1 &> /tmp/scopas-vmstat.log &"
+	$RSH "mpstat -P ALL 1 &> /tmp/scopas-mpstat.log &"
+	$RSH "iostat -xz 1 &> /tmp/scopas-iostat.log &"
 }
-
-yellow "(2/6) Configuring Linode instance"
-
-log Bootstrapping package manager
-rcmd_install "zypper refresh && zypper -n install -y PackageKit"
-
-log Installing packages
-rcmd_install "pkcon -y install gcc git make flex bison patch libelf-devel libopenssl-devel bc sysstat"
-
-log Monitoring builder
-
-$RSH "vmstat 1 &> /tmp/scopas-vmstat.log &"
-$RSH "mpstat -P ALL 1 &> /tmp/scopas-mpstat.log &"
-$RSH "iostat -xz 1 &> /tmp/scopas-iostat.log &"
 
 #
 # 4. Remote git clone into shm
 #
+function remote_git() {
 
-if [ ! -d .git ] || [ ! -e ./Kbuild ]; then
-	die "Not running inside git repository?"
-fi
+	if [ ! -d .git ] || [ ! -e ./Kbuild ]; then
+		die "Not running inside git repository?"
+	fi
 
-LOCAL_BRANCH=`git rev-parse --abbrev-ref HEAD`
-TRACKING_REMOTE=`git config branch.$LOCAL_BRANCH.remote`
-REMOTE_URL=`git config remote.$TRACKING_REMOTE.url`
-LOCAL_REF=`git merge-base @{u} HEAD`
+	LOCAL_BRANCH=`git rev-parse --abbrev-ref HEAD`
+	TRACKING_REMOTE=`git config branch.$LOCAL_BRANCH.remote`
+	REMOTE_URL=`git config remote.$TRACKING_REMOTE.url`
+	LOCAL_REF=`git merge-base @{u} HEAD`
+	URL_FILENAME=$(echo $REMOTE_URL | sed -e 's;\(http.*\|git\|ssh\)://;;' -e 's;.*@;;')
 
-function rcmd_git() {
-	$RSH "( $* ) &>> /tmp/scopas-git.log"
-	[ $? -eq 0 ] || die "Failed to clone git repository"
+	function rcmd_git() {
+		$RSH "( $* ) &>> /tmp/scopas-git.log"
+		[ $? -eq 0 ] || die "Failed to clone git repository"
+	}
+
+	GIT_URL="/mnt/scopas-vol/${URL_FILENAME}"
+	$RSH "[ -d /mnt/scopas-vol/${URL_FILENAME} ]"
+	[ $? -ne 0 ] && {
+		log "Creating mirror of git repository... This may take a few minutes"
+
+		D=$(dirname $URL_FILENAME)
+		rcmd_git "cd /mnt/scopas-vol && mkdir -p $D && cd $D && git clone --mirror $REMOTE_URL"
+	}
+
+	log Pushing latest git commits
+
+	GIT_SSH_COMMAND="ssh $FLAGS -i $SSH_KEY_PATH" git push --quiet --force ssh://root@$BUILDER_IP:$GIT_URL
+	[ $? -eq 0 ] || die "Failed to push changes"
+
+	yellow "(3/6) Cloning git repository and setting HEAD @ $LOCAL_REF"
+
+	rcmd_git "mkdir /dev/shm/build && cd /dev/shm/build && git clone $GIT_URL kernel && cd /dev/shm/build/kernel && git reset --hard $LOCAL_REF"
 }
-
-yellow "(3/6) Cloning git repository and setting HEAD @ $LOCAL_REF"
-
-rcmd_git "mkdir /dev/shm/build && cd /dev/shm/build && git clone $REMOTE_URL kernel && cd /dev/shm/build/kernel && git reset --hard $LOCAL_REF"
 
 #
 # 5. Upload delta
 #
 
-yellow "(4/6) Patching kernel source"
+function upload_delta() {
+	yellow "(4/6) Patching kernel source"
 
-# Check that the diff is non-empty
-[ $(git diff $LOCAL_REF..HEAD | wc -l) -gt 0 ] && {
-	log Creating kernel patch
-	PATCH_FILE=$(mktemp).patch
-	git diff @{u}..HEAD > ${PATCH_FILE}
+	# Check that the diff is non-empty
+	[ $(git diff $LOCAL_REF..HEAD | wc -l) -gt 0 ] && {
+		log Creating kernel patch
+		PATCH_FILE=$(mktemp).patch
+		git diff @{u}..HEAD > ${PATCH_FILE}
 
-	log Uploading kernel patch ${PATCH_FILE}
-	scp $FLAGS ${PATCH_FILE} root@$BUILDER_IP:/dev/shm/build/kernel/
+		log Uploading kernel patch ${PATCH_FILE}
+		scp $FLAGS ${PATCH_FILE} root@$BUILDER_IP:/dev/shm/build/kernel/
 
-	rcmd_git "cd /dev/shm/build/kernel && patch -p1 < $(basename ${PATCH_FILE})"
+		rcmd_git "cd /dev/shm/build/kernel && patch -p1 < $(basename ${PATCH_FILE})"
+	}
 }
 
 #
 # 6. Remote build
 #
-function rcmd_build() {
-	$RSH "( $* ) &>> /tmp/scopas-build.log"
-	[ $? -eq 0 ] || die "Failed to build kernel"
+function remote_build() {
+	function rcmd_build() {
+		$RSH "( $* ) &>> /tmp/scopas-build.log"
+		[ $? -eq 0 ] || die "Failed to build kernel"
+	}
+
+	yellow "(5/6) Building kernel"
+
+	rcmd_build "cd /dev/shm/build/kernel && make defconfig && make -j\`nproc\` all"
+
+	green Successfully built kernel
 }
 
-yellow "(5/6) Building kernel"
-
-rcmd_build "cd /dev/shm/build/kernel && make defconfig && make -j\`nproc\` all"
-
-green Successfully built kernel
+create_builder
+configure_builder
+remote_git
+upload_delta
+remote_build
 
 #
 # 7. Fetch results log
@@ -282,3 +515,11 @@ fetch_logs
 delete_builder
 BUILDER_LIVE=false
 yellow "(6/6) Finished"
+
+[ $STATS = true ] && {
+	END_BALANCE="$(get_balances)"
+
+	COST=$(jq -n "$END_BALANCE - $START_BALANCE")
+
+	echo "This build cost $COST"
+}
