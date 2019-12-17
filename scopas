@@ -47,7 +47,7 @@ function yellow() {
 }
 
 function fetch_logs() {
-	log Fetching results and monitoring logs
+	debug Fetching results and monitoring logs
 	$RSH "systemd-analyze blame &> /tmp/scopas-systemd-analyze-blame.log"
 	$RSH "systemd-analyze critical-chain &> /tmp/scopas-systemd-analyze-critical-chain.log"
 
@@ -56,7 +56,7 @@ function fetch_logs() {
 
 function delete_builder() {
 	if [ "$CREATE_IMAGE" = true ]; then
-		log Creating new golden image
+		debug Creating new golden image
 
 		OUTPUT=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
 		    https://api.linode.com/v4/linode/instances/$BUILDER_ID/configs)
@@ -80,7 +80,7 @@ function delete_builder() {
 		read
 	fi
 
-	log Shutting down instance
+	debug Shutting down instance
 	OUTPUT=$(curl -s -H "Content-Type: application/json" \
 	    -H "Authorization: Bearer $API_TOKEN" \
 	    -X POST \
@@ -98,7 +98,7 @@ function delete_builder() {
 	    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
 	    python -c "import sys, json; print(json.load(sys.stdin))['status']")
 
-	log Deleting builder $BUILDER_ID
+	debug Deleting builder $BUILDER_ID
 	curl -s -H "Authorization: Bearer $API_TOKEN" \
 	    -X DELETE \
 	    https://api.linode.com/v4/linode/instances/$BUILDER_ID 2>&1 >/dev/null
@@ -198,7 +198,7 @@ done
 #
 
 [ -e ~/.scopas ] && {
-	log "Using configuration file ~/.scopas"
+	debug "Using configuration file ~/.scopas"
 
 	function get_config() {
 		echo $(grep "$*" ~/.scopas | awk -F= '{print $2}')
@@ -284,7 +284,7 @@ function create_builder() {
 	BUILDER_ID=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['id']")
 	BUILDER_IP=$(echo $OUTPUT | python -c "import sys, json; print(json.load(sys.stdin))['ipv4'][0]")
 
-	log "Found $NAME (ID: $BUILDER_ID) @ $BUILDER_IP"
+	debug "Found $NAME (ID: $BUILDER_ID) @ $BUILDER_IP"
 
 	BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
 	    https://api.linode.com/v4/linode/instances/$BUILDER_ID | \
@@ -292,7 +292,7 @@ function create_builder() {
 
 	debug $BUILDER_STATUS
 
-	log Provisioning builder
+	debug Provisioning builder
 	BUILDER_STATUS=provisioning
 	while [ "$BUILDER_STATUS" = "provisioning" ]; do
 		BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
@@ -302,7 +302,7 @@ function create_builder() {
 		sleep 2
 	done
 
-	log Booting builder
+	debug Booting builder
 	BUILDER_STATUS=booting
 	while [ "$BUILDER_STATUS" = "booting" ]; do
 		BUILDER_STATUS=$(curl -s -H "Authorization: Bearer $API_TOKEN" \
@@ -344,7 +344,7 @@ function configure_builder() {
 
 	yellow "(2/6) Configuring Linode instance"
 
-	log Cleaning old logs
+	debug Cleaning old logs
 	$RSH "rm -f /tmp/scopas-*.log"
 
 	[ $CREATE_IMAGE = true ] && {
@@ -359,7 +359,7 @@ function configure_builder() {
 		#$RSH "sed -i -e 's;DHCLIENT6_WAIT_AT_BOOT=.*;DHCLIENT6_WAIT_AT_BOOT=\"1\";' /etc/sysconfig/network/dhcp"
 		#$RSH "sed -i -e 's;WAIT_FOR_INTERFACES=.*;WAIT_FOR_INTERFACES=\"\";' /etc/sysconfig/network/config"
 
-		log "Reducing boot loader menu timeout"
+		debug "Reducing boot loader menu timeout"
 		$RSH "sed -i -e 's;set timeout=.*;set timeout=\"0\";' /boot/grub/grub.cfg"
 
 	}
@@ -375,7 +375,7 @@ function configure_builder() {
 
 		CONFIG_ID=$(echo $OUTPUT | jq '.data[0].id')
 
-		log "Attaching vol: $VOLUME_ID (config: $CONFIG_ID)"
+		debug "Attaching vol: $VOLUME_ID (config: $CONFIG_ID)"
 		OUTPUT=$(curl -s -H "Content-Type: application/json" \
 		    -H "Authorization: Bearer $API_TOKEN" \
 		    -X POST -d '{
@@ -385,12 +385,12 @@ function configure_builder() {
 		    https://api.linode.com/v4/volumes/$VOLUME_ID/attach)
 
 		[ "$($RSH 'grep scopas-vol /etc/fstab')" = "" ] && {
-			log "Adding storage volume to /etc/fstab"
+			debug "Adding storage volume to /etc/fstab"
 			$RSH "mkdir -p /mnt/scopas-vol"
 			$RSH "echo '/dev/disk/by-id/scsi-0Linode_Volume_scopas-vol /mnt/scopas-vol ext4 defaults,noatime,nofail,data=writeback,barrier=0 0 2' >> /etc/fstab"
 		}
 
-		log "Mounting volume"
+		debug "Mounting volume"
 		$RSH "mount /mnt/scopas-vol"
 
 		# Spin until disk appears
@@ -405,7 +405,7 @@ function configure_builder() {
 	}
 
 	[ "$($RSH 'make --version' 2>&1 | grep 'not found')" = "" ] || {
-		log Installing packages
+		debug Installing packages
 
 		# Ubuntu
 		#rcmd_install "apt update && DEBIAN_FRONTEND=noninteractive apt-get --assume-yes install -qq gcc git make flex bison patch libelf-dev bc sysstat libssl-dev"
@@ -414,7 +414,7 @@ function configure_builder() {
 		rcmd_install "zypper refresh && zypper -n install -y gcc git make flex bison patch libelf-devel libopenssl-devel bc sysstat"
 	}
 
-	log Monitoring builder
+	debug Monitoring builder
 
 	$RSH "vmstat 1 &> /tmp/scopas-vmstat.log &"
 	$RSH "mpstat -P ALL 1 &> /tmp/scopas-mpstat.log &"
@@ -444,13 +444,13 @@ function remote_git() {
 	GIT_URL="/mnt/scopas-vol/${URL_FILENAME}"
 	$RSH "[ -d /mnt/scopas-vol/${URL_FILENAME} ]"
 	[ $? -ne 0 ] && {
-		log "Creating mirror of git repository... This may take a few minutes"
+		debug "Creating mirror of git repository... This may take a few minutes"
 
 		D=$(dirname $URL_FILENAME)
 		rcmd_git "cd /mnt/scopas-vol && mkdir -p $D && cd $D && git clone --mirror $REMOTE_URL"
 	}
 
-	log Pushing latest git commits
+	debug Pushing latest git commits
 
 	GIT_SSH_COMMAND="ssh $FLAGS -i $SSH_KEY_PATH" git push --quiet --force ssh://root@$BUILDER_IP:$GIT_URL
 	[ $? -eq 0 ] || die "Failed to push changes"
@@ -469,11 +469,11 @@ function upload_delta() {
 
 	# Check that the diff is non-empty
 	[ $(git diff $LOCAL_REF..HEAD | wc -l) -gt 0 ] && {
-		log Creating kernel patch
+		debug Creating kernel patch
 		PATCH_FILE=$(mktemp).patch
 		git diff @{u}..HEAD > ${PATCH_FILE}
 
-		log Uploading kernel patch ${PATCH_FILE}
+		debug Uploading kernel patch ${PATCH_FILE}
 		scp $FLAGS ${PATCH_FILE} root@$BUILDER_IP:/dev/shm/build/kernel/
 
 		rcmd_git "cd /dev/shm/build/kernel && patch -p1 < $(basename ${PATCH_FILE})"
