@@ -15,11 +15,11 @@
 // - Support multiple providers in the scopas config file
 // - Versioning of disk images and updates when new features/optimisations are supported
 // - Docker support to simplify building multiple architectures (crosstool, etc)
-// - Move all logs to ~/.scopas/logs/
 //
 // DONE
 // --stats support
 // - Help for command-line arguments
+// - Move all logs to ~/.scopas/logs/
 
 package main
 
@@ -293,7 +293,7 @@ func (builder *Builder) Configure() {
 	runRemoteCmd(builder, "uname -r")
 
 	debug("Cleaning old logs")
-	runRemoteCmd(builder, "rm -f /tmp/scopas-*.log")
+	runRemoteCmd(builder, "rm -fr /tmp/scopas/ ; mkdir -p /tmp/scopas/")
 
 	// Mount volumes
 	if builder.Provider.Volume != "" {
@@ -307,20 +307,20 @@ func (builder *Builder) Configure() {
 		case "opensuse15.1":
 			runRemoteCmd(builder, "zypper refresh && zypper -n install -y gcc bc "+
 				"cpio git make flex bison patch libelf-devel "+
-				"libopenssl-devel bc sysstat dpkg fakeroot rpmbuild ts | tee /tmp/scopas-install.log")
+				"libopenssl-devel bc sysstat dpkg fakeroot rpmbuild ts | tee /tmp/scopas/install.log")
 		case "ubuntu18.04":
 			//runRemoteCmd(builder, "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y gcc bc "+
 			//	"cpio git make flex bison patch libelf-dev")
 			runRemoteCmd(builder, "DEBIAN_FRONTEND=noninteractive apt-get update")
-			runRemoteCmd(builder, "DEBIAN_FRONTEND=noninteractive apt-get install -y libncurses-dev flex bison openssl libssl-dev dkms libelf-dev libudev-dev libpci-dev libiberty-dev autoconf git make gcc bc flex bison patch libelf-dev moreutils 2>&1 | tee /tmp/scopas-install.log")
+			runRemoteCmd(builder, "DEBIAN_FRONTEND=noninteractive apt-get install -y libncurses-dev flex bison openssl libssl-dev dkms libelf-dev libudev-dev libpci-dev libiberty-dev autoconf git make gcc bc flex bison patch libelf-dev moreutils 2>&1 | tee /tmp/scopas/install.log")
 		}
 	}
 
 	debug("Monitoring builder")
 
-	runRemoteCmd(builder, "vmstat 1 | ts &> /tmp/scopas-vmstat.log &")
-	runRemoteCmd(builder, "mpstat -P ALL 1 | ts &> /tmp/scopas-mpstat.log &")
-	runRemoteCmd(builder, "iostat -xz 1 | ts &> /tmp/scopas-iostat.log &")
+	runRemoteCmd(builder, "vmstat 1 | ts &> /tmp/scopas/vmstat.log &")
+	runRemoteCmd(builder, "mpstat -P ALL 1 | ts &> /tmp/scopas/mpstat.log &")
+	runRemoteCmd(builder, "iostat -xz 1 | ts &> /tmp/scopas/iostat.log &")
 }
 
 func (builder *Builder) RemoteGit() {
@@ -360,7 +360,7 @@ func (builder *Builder) RemoteGit() {
 	if err != nil {
 		debug("Creating mirror of git repository... This may take a few minutes")
 
-		cmdString = fmt.Sprintf("cd /mnt/scopas-vol && mkdir -p %s && cd %s && git clone --mirror %s | tee /tmp/scopas-git-mirror.log", gitPath, remoteUrl)
+		cmdString = fmt.Sprintf("cd /mnt/scopas-vol && mkdir -p %s && cd %s && git clone --mirror %s | tee /tmp/scopas/git-mirror.log", gitPath, remoteUrl)
 		runRemoteCmd(builder, cmdString)
 	}
 
@@ -372,7 +372,7 @@ func (builder *Builder) RemoteGit() {
 	s = fmt.Sprintf("(3/6) Cloning git repository and setting HEAD @ %s", localRef)
 	log(s)
 
-	cmdString = fmt.Sprintf("mkdir /dev/shm/build && cd /dev/shm/build && git clone %s kernel && cd /dev/shm/build/kernel && git reset --hard %s | tee /tmp/scopas-git-clone.log", gitUrl, localRef)
+	cmdString = fmt.Sprintf("mkdir /dev/shm/build && cd /dev/shm/build && git clone %s kernel && cd /dev/shm/build/kernel && git reset --hard %s | tee /tmp/scopas/git-clone.log", gitUrl, localRef)
 	runRemoteCmd(builder, cmdString)
 }
 
@@ -381,17 +381,32 @@ func (builder *Builder) RemoteBuild() {
 
 	target := "all modules"
 
-	cmd := fmt.Sprintf("cd /dev/shm/build/kernel && make defconfig && make -j`nproc` %s | ts | tee /tmp/scopas-build.log", target)
+	// Build .deb or .rpm packages?
+	if cfgFlags.pkg {
+		switch builder.GetDistro() {
+		case "opensuse15.1":
+			target = "binrpm-pkg"
+		case "ubuntu18.04":
+			target = "bindeb-pkg"
+		}
+	}
+
+	cmd := fmt.Sprintf("cd /dev/shm/build/kernel && make defconfig && make -j`nproc` %s | ts | tee /tmp/scopas/build.log", target)
 	runRemoteCmd(builder, cmd)
 }
 
 func (builder *Builder) FetchLogs() {
 	debug("Fetching results and monitoring logs")
 
-	runRemoteCmd(builder, "systemd-analyze blame &> /tmp/scopas-systemd-analyze-blame.log")
-	runRemoteCmd(builder, "systemd-analyze critical-chain &> /tmp/scopas-systemd-analyze-critical-chain.log")
+	d := fmt.Sprintf("%s/.scopas/logs/%s", os.ExpandEnv("$HOME"), time.Now().Format(time.RFC3339))
+	if err := os.MkdirAll(d, 0755); err != nil {
+		die("Failed to create logs directory")
+	}
 
-	runShellScript("#!/bin/bash\n/usr/bin/scp -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=1 root@%s:/tmp/scopas-*.log .\n", builder.Provider.SSHKeyPath, builder.Ipv4)
+	runRemoteCmd(builder, "systemd-analyze blame &> /tmp/scopas/systemd-analyze-blame.log")
+	runRemoteCmd(builder, "systemd-analyze critical-chain &> /tmp/scopas/systemd-analyze-critical-chain.log")
+
+	runShellScript("#!/bin/bash\n/usr/bin/scp -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=1 root@%s:/tmp/scopas/*.log %s\n", builder.Provider.SSHKeyPath, builder.Ipv4, d)
 }
 
 func (builder *Builder) Destroy() {
